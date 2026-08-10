@@ -138,7 +138,7 @@ async function startBotInstance(sessionName, options = {}) {
       try {
         // Accept phoneNumber from options (e.g. from getSessionFiles command) or prompt
         let phoneNumber = options.phoneNumber;
-        if (!phoneNumber) {
+        if (!phoneNumber && process.stdin.isTTY) {
           const answer = await inquirer.prompt([
             {
               type: "input",
@@ -149,6 +149,9 @@ async function startBotInstance(sessionName, options = {}) {
             },
           ]);
           phoneNumber = answer.phoneNumber;
+        } else if (!phoneNumber) {
+            console.error(chalk.red(`[${sessionName}] PHONE_NUMBER required for pairing code auth with no TTY.`));
+            return;
         }
         console.log(chalk.yellow(`[${sessionName}] Requesting pairing code...`));
         const code = await sock.requestPairingCode(phoneNumber.trim());
@@ -566,10 +569,29 @@ process.on("unhandledRejection", (reason, promise) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-startSessions().catch((error) => {
-  console.error(chalk.red(`Failed to start: ${error.message}`));
+const sessionIdArg = process.env.SESSION_ID || process.argv[2];
+const isInteractive = process.stdin.isTTY;
+
+if (sessionIdArg) {
+  const authMethod = process.env.AUTH_METHOD || "qr";
+  const phoneNumber = process.env.PHONE_NUMBER;
+
+  console.log(chalk.blue(`Starting non-interactive session: ${chalk.cyan(sessionIdArg)} (${authMethod})`));
+
+  startBotInstance(sessionIdArg, { authMethod, phoneNumber }).catch((error) => {
+    console.error(chalk.red(`Failed to start ${sessionIdArg}: ${error.message}`));
+    process.exit(1);
+  });
+} else if (isInteractive) {
+  startSessions().catch((error) => {
+    console.error(chalk.red(`Failed to start: ${error.message}`));
+    process.exit(1);
+  });
+} else {
+  console.error(chalk.red("No SESSION_ID provided and no TTY available for interactive selection."));
+  console.error(chalk.yellow("Run with: SESSION_ID=<name> node index.js  (add AUTH_METHOD=code PHONE_NUMBER=... for pairing code)"));
   process.exit(1);
-});
+}
 
 module.exports = {
   startBotInstance,
