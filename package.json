@@ -4,7 +4,7 @@
     "baileys": "github:whiskeysockets/baileys",
     "chalk": "^4.1.2",
     "express": "^5.2.1",
-    "inquirer": "^8.2.7",
+    "inquirer": "^14.1.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0"
   }
