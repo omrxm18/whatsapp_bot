@@ -1,16 +1,54 @@
-const {
-  default: makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
-  downloadMediaMessage,
-} = require("@whiskeysockets/baileys");
-const qrcode = require("qrcode-terminal");
-const P = require("pino");
-const fs = require("fs");
-const path = require("path");
-const inquirer = require("inquirer");
-const chalk = require("chalk");
-const { setupGlobalHotReload } = require("./functions/reloadCommands");
+  type WASocket,
+  type BaileysEventMap,
+} from "@whiskeysockets/baileys";
+import qrcode from "qrcode-terminal";
+import P from "pino";
+import fs from "fs";
+import path from "path";
+import inquirer from "inquirer";
+import chalk from "chalk";
+import { setupGlobalHotReload } from "./functions/reloadCommands";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type SessionSocket = WASocket & { sessionName?: string };
+
+interface PendingSession {
+  sock: SessionSocket;
+  attempts: number;
+  cancelled: boolean;
+}
+
+interface StartOptions {
+  authMethod?: "qr" | "code";
+  phoneNumber?: string;
+  qrHandler?: (qr: string, attempt: number) => void | Promise<void>;
+  onCancel?: () => void | Promise<void>;
+}
+
+interface MyJid {
+  id: string;
+  lid: string | null;
+}
+
+interface Command {
+  name: string;
+  execute: (
+    sock: SessionSocket,
+    msg: BaileysEventMap["messages.upsert"]["messages"][number],
+    args: string[],
+    myJid: MyJid,
+    sender: string,
+    activeSessions: Record<string, SessionSocket>,
+    sessionsToNotReconnect: Set<string>,
+    startBotInstance: (name: string, options?: StartOptions) => Promise<SessionSocket | undefined>,
+    pendingSessions: Record<string, PendingSession>,
+    isSessionFolderEmpty: (sessionPath: string) => boolean
+  ) => Promise<void> | void;
+}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 const SESSIONS_DIR = "sessions";
@@ -20,10 +58,10 @@ const commandsPath = path.join(__dirname, "commands");
 const sessionCommandsPath = path.join(__dirname, "sessionsCommands");
 
 // ─── State ────────────────────────────────────────────────────────────────────
-const activeSessions = {};
-const sessionsToNotReconnect = new Set();
-const pendingSessions = {};
-const reconnectGuards = new Set();
+const activeSessions: Record<string, SessionSocket> = {};
+const sessionsToNotReconnect = new Set<string>();
+const pendingSessions: Record<string, PendingSession> = {};
+const reconnectGuards = new Set<string>();
 
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 if (!fs.existsSync(SESSIONS_DIR)) {
@@ -31,33 +69,37 @@ if (!fs.existsSync(SESSIONS_DIR)) {
     fs.mkdirSync(SESSIONS_DIR);
     console.log(chalk.green("Created sessions directory"));
   } catch (error) {
-    console.error(chalk.red(`Failed to create sessions directory: ${error.message}`));
+    console.error(chalk.red(`Failed to create sessions directory: ${errMsg(error)}`));
     process.exit(1);
   }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function isValidSessionName(name) {
+function errMsg(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isValidSessionName(name: string): boolean {
   return /^[a-zA-Z0-9-_]{3,20}$/.test(name);
 }
 
-function isSessionFolderEmpty(sessionPath) {
+function isSessionFolderEmpty(sessionPath: string): boolean {
   try {
     if (!fs.existsSync(sessionPath)) return true;
     const files = fs.readdirSync(sessionPath);
     return files.length === 0 || (files.length === 1 && files[0] === ".DS_Store");
   } catch (error) {
-    console.error(chalk.red(`Error checking session folder ${sessionPath}: ${error.message}`));
+    console.error(chalk.red(`Error checking session folder ${sessionPath}: ${errMsg(error)}`));
     return false;
   }
 }
 
-async function cleanupSession(sessionName, sessionFolder) {
+async function cleanupSession(sessionName: string, sessionFolder: string): Promise<void> {
   try {
     if (pendingSessions[sessionName]) {
-      pendingSessions[sessionName].sock?.ev?.removeAllListeners();
-      pendingSessions[sessionName].sock?.end();
+      pendingSessions[sessionName].sock?.ev?.removeAllListeners("connection.update");
+      pendingSessions[sessionName].sock?.end(undefined);
       delete pendingSessions[sessionName];
     }
     if (fs.existsSync(sessionFolder) && isSessionFolderEmpty(sessionFolder)) {
@@ -65,11 +107,11 @@ async function cleanupSession(sessionName, sessionFolder) {
       console.log(chalk.green(`[${sessionName}] Removed empty session folder`));
     }
   } catch (error) {
-    console.error(chalk.red(`[${sessionName}] Error during cleanup: ${error.message}`));
+    console.error(chalk.red(`[${sessionName}] Error during cleanup: ${errMsg(error)}`));
   }
 }
 
-async function loadCommands(dir, commands) {
+async function loadCommands(dir: string, commands: Map<string, Command>): Promise<void> {
   try {
     if (!fs.existsSync(dir)) {
       console.warn(chalk.yellow(`Commands directory ${dir} does not exist, skipping...`));
@@ -85,29 +127,32 @@ async function loadCommands(dir, commands) {
         } else if (file.endsWith(".js")) {
           try {
             delete require.cache[require.resolve(fullPath)];
-            const command = require(fullPath);
+            const command = require(fullPath) as Partial<Command> | undefined;
             if (command?.name && typeof command.execute === "function") {
-              commands.set(command.name, command);
+              commands.set(command.name, command as Command);
               console.log(chalk.green(`Command loaded ✅ : ${chalk.cyan(command.name)}`));
             } else {
               console.warn(chalk.yellow(`Skipped invalid command at ${fullPath} — missing name or execute`));
             }
           } catch (cmdError) {
-            console.error(chalk.red(`Failed to load command from ${fullPath}: ${cmdError.message}`));
+            console.error(chalk.red(`Failed to load command from ${fullPath}: ${errMsg(cmdError)}`));
           }
         }
       } catch (fileError) {
-        console.error(chalk.red(`Error processing file ${fullPath}: ${fileError.message}`));
+        console.error(chalk.red(`Error processing file ${fullPath}: ${errMsg(fileError)}`));
       }
     }
   } catch (dirError) {
-    console.error(chalk.red(`Failed to read directory ${dir}: ${dirError.message}`));
+    console.error(chalk.red(`Failed to read directory ${dir}: ${errMsg(dirError)}`));
   }
 }
 
 // ─── Core ─────────────────────────────────────────────────────────────────────
 
-async function startBotInstance(sessionName, options = {}) {
+async function startBotInstance(
+  sessionName: string,
+  options: StartOptions = {}
+): Promise<SessionSocket | undefined> {
   const sessionFolder = path.join(SESSIONS_DIR, sessionName);
 
   try {
@@ -118,14 +163,14 @@ async function startBotInstance(sessionName, options = {}) {
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
 
-    const sock = makeWASocket({
+    const sock: SessionSocket = makeWASocket({
       logger: P({ level: "fatal", enabled: false }),
       auth: state,
       printQRInTerminal: false,
       browser: ["omrx", "Arch Linux", "1.0"],
       connectTimeoutMs: 60000,
       retryRequestDelayMs: 1000,
-      maxConcurrentTransactions: 30,
+      maxMsgRetryCount: 5,
       keepAliveIntervalMs: 10000,
       markOnlineOnConnect: true,
     });
@@ -139,29 +184,30 @@ async function startBotInstance(sessionName, options = {}) {
         // Accept phoneNumber from options (e.g. from getSessionFiles command) or prompt
         let phoneNumber = options.phoneNumber;
         if (!phoneNumber && process.stdin.isTTY) {
-          const answer = await inquirer.prompt([
+          const answer = await inquirer.prompt<{ phoneNumber: string }>([
             {
               type: "input",
               name: "phoneNumber",
               message: chalk.cyan(`[${sessionName}] Enter phone number (with country code, no + or spaces):`),
-              validate: (input) =>
-                /^\d{10,15}$/.test(input.trim()) || chalk.red("Invalid number — digits only, 10-15 chars (e.g. 201234567890)"),
+              validate: (input: string) =>
+                /^\d{10,15}$/.test(input.trim()) ||
+                chalk.red("Invalid number — digits only, 10-15 chars (e.g. 201234567890)"),
             },
           ]);
           phoneNumber = answer.phoneNumber;
         } else if (!phoneNumber) {
-            console.error(chalk.red(`[${sessionName}] PHONE_NUMBER required for pairing code auth with no TTY.`));
-            return;
+          console.error(chalk.red(`[${sessionName}] PHONE_NUMBER required for pairing code auth with no TTY.`));
+          return;
         }
         console.log(chalk.yellow(`[${sessionName}] Requesting pairing code...`));
-        const code = await sock.requestPairingCode(phoneNumber.trim());
+        const code = await sock.requestPairingCode(phoneNumber!.trim());
         console.log(
           chalk.greenBright(`[${sessionName}] Pairing code: `) +
-          chalk.bold.white(code) +
-          chalk.greenBright(" — Enter this in WhatsApp > Linked Devices > Link with phone number")
+            chalk.bold.white(code) +
+            chalk.greenBright(" — Enter this in WhatsApp > Linked Devices > Link with phone number")
         );
       } catch (error) {
-        console.error(chalk.red(`[${sessionName}] Failed to get pairing code: ${error.message}`));
+        console.error(chalk.red(`[${sessionName}] Failed to get pairing code: ${errMsg(error)}`));
       }
     }
 
@@ -190,7 +236,7 @@ async function startBotInstance(sessionName, options = {}) {
             await cleanupSession(sessionName, sessionFolder);
             await options.onCancel?.();
           } catch (error) {
-            console.error(chalk.red(`[${sessionName}] Error cancelling session: ${error.message}`));
+            console.error(chalk.red(`[${sessionName}] Error cancelling session: ${errMsg(error)}`));
           }
           return;
         }
@@ -203,7 +249,7 @@ async function startBotInstance(sessionName, options = {}) {
             qrcode.generate(qr, { small: true });
           }
         } catch (error) {
-          console.error(chalk.red(`[${sessionName}] QR handler error: ${error.message}`));
+          console.error(chalk.red(`[${sessionName}] QR handler error: ${errMsg(error)}`));
           qrcode.generate(qr, { small: true });
         }
       }
@@ -218,9 +264,11 @@ async function startBotInstance(sessionName, options = {}) {
 
       // Disconnected
       if (connection === "close") {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const statusCode: number | undefined = (
+          lastDisconnect?.error as { output?: { statusCode?: number } } | undefined
+        )?.output?.statusCode;
         const reason = statusCode
-          ? `${statusCode} - ${DisconnectReason[statusCode] ?? "Unknown"}`
+          ? `${statusCode} - ${(DisconnectReason as Record<number, string>)[statusCode] ?? "Unknown"}`
           : "Unknown reason";
 
         console.log(chalk.red(`[${sessionName}] Disconnected: ${reason}`));
@@ -262,7 +310,7 @@ async function startBotInstance(sessionName, options = {}) {
     });
 
     // ── Commands ──────────────────────────────────────────────────────────────
-    const commands = new Map();
+    const commands = new Map<string, Command>();
     try {
       console.log(chalk.blue(`[${sessionName}] Loading commands...`));
       await loadCommands(commandsPath, commands);
@@ -277,11 +325,11 @@ async function startBotInstance(sessionName, options = {}) {
 
       console.log(chalk.green(`[${sessionName}] Loaded ${commands.size} commands`));
     } catch (error) {
-      console.error(chalk.red(`[${sessionName}] Failed to load commands: ${error.message}`));
+      console.error(chalk.red(`[${sessionName}] Failed to load commands: ${errMsg(error)}`));
     }
 
     // ── Message handler ───────────────────────────────────────────────────────
-    sock.ev.on("messages.upsert", async (m) => {
+    sock.ev.on("messages.upsert", async (m: { messages: string | any[]; }) => {
       try {
         if (!m?.messages?.length) return;
 
@@ -291,12 +339,13 @@ async function startBotInstance(sessionName, options = {}) {
         const sender = msg.key.participant || msg.key.remoteJid;
         if (!sender || !sock.user) return;
 
-        const MyJid = {
-          id: sock.user.id.split(":")[0] + "@s.whatsapp.net",
-          lid: sock.user.lid ? sock.user.lid.split(":")[0] + "@lid" : null,
+        const user = sock.user as typeof sock.user & { lid?: string };
+        const myJid: MyJid = {
+          id: user.id.split(":")[0] + "@s.whatsapp.net",
+          lid: user.lid ? user.lid.split(":")[0] + "@lid" : null,
         };
 
-        if (!msg.key.fromMe && !(MyJid.lid && sender === MyJid.lid)) return;
+        if (!msg.key.fromMe && !(myJid.lid && sender === myJid.lid)) return;
 
         const text =
           msg.message.conversation ||
@@ -321,7 +370,7 @@ async function startBotInstance(sessionName, options = {}) {
             sock,
             msg,
             args,
-            MyJid,
+            myJid,
             sender,
             activeSessions,
             sessionsToNotReconnect,
@@ -330,29 +379,29 @@ async function startBotInstance(sessionName, options = {}) {
             isSessionFolderEmpty
           );
         } catch (error) {
-          console.error(chalk.red(`[${sessionName}] ❌ Command "${commandName}" failed: ${error.message}`));
-          console.error(chalk.red(error.stack));
+          console.error(chalk.red(`[${sessionName}] ❌ Command "${commandName}" failed: ${errMsg(error)}`));
+          if (error instanceof Error) console.error(chalk.red(error.stack));
         }
       } catch (error) {
-        console.error(chalk.red(`[${sessionName}] Error processing message: ${error.message}`));
+        console.error(chalk.red(`[${sessionName}] Error processing message: ${errMsg(error)}`));
       }
     });
 
     return sock;
   } catch (error) {
-    console.error(chalk.red(`[${sessionName}] Failed to start bot instance: ${error.message}`));
+    console.error(chalk.red(`[${sessionName}] Failed to start bot instance: ${errMsg(error)}`));
     throw error;
   }
 }
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
-async function startSessions() {
+async function startSessions(): Promise<void> {
   try {
     console.log(chalk.blueBright("🤖 WhatsApp Multi-Session Bot Manager"));
     console.log(chalk.blueBright("====================================="));
 
-    let sessions = [];
+    let sessions: string[] = [];
     try {
       if (fs.existsSync(SESSIONS_DIR)) {
         sessions = fs.readdirSync(SESSIONS_DIR).filter((session) => {
@@ -365,7 +414,7 @@ async function startSessions() {
         });
       }
     } catch (error) {
-      console.error(chalk.red(`Error reading sessions directory: ${error.message}`));
+      console.error(chalk.red(`Error reading sessions directory: ${errMsg(error)}`));
     }
 
     console.log(chalk.blueBright("Available sessions:"));
@@ -391,7 +440,7 @@ async function startSessions() {
         ? allChoices
         : allChoices.filter((c) => !["run", "delete", "all"].includes(c.value));
 
-    const { action } = await inquirer.prompt([
+    const { action } = await inquirer.prompt<{ action: string }>([
       {
         type: "list",
         name: "action",
@@ -406,7 +455,7 @@ async function startSessions() {
     }
 
     if (action === "delete") {
-      const { sessionName } = await inquirer.prompt([
+      const { sessionName } = await inquirer.prompt<{ sessionName: string }>([
         {
           type: "list",
           name: "sessionName",
@@ -415,7 +464,7 @@ async function startSessions() {
         },
       ]);
 
-      const { confirm } = await inquirer.prompt([
+      const { confirm } = await inquirer.prompt<{ confirm: boolean }>([
         {
           type: "confirm",
           name: "confirm",
@@ -427,8 +476,8 @@ async function startSessions() {
       if (confirm) {
         try {
           if (activeSessions[sessionName]) {
-            activeSessions[sessionName].ev.removeAllListeners();
-            activeSessions[sessionName].end();
+            activeSessions[sessionName].ev.removeAllListeners("connection.update");
+            activeSessions[sessionName].end(undefined);
             delete activeSessions[sessionName];
           }
           const sessionPath = path.join(SESSIONS_DIR, sessionName);
@@ -437,7 +486,7 @@ async function startSessions() {
             console.log(chalk.green(`✅ Session "${sessionName}" deleted`));
           }
         } catch (error) {
-          console.error(chalk.red(`Failed to delete session: ${error.message}`));
+          console.error(chalk.red(`Failed to delete session: ${errMsg(error)}`));
         }
       } else {
         console.log(chalk.yellow("Deletion cancelled"));
@@ -459,7 +508,7 @@ async function startSessions() {
           activeSessions[session]
             ? (console.log(chalk.yellow(`${session} already active, skipping`)), Promise.resolve())
             : startBotInstance(session).catch((e) =>
-                console.error(chalk.red(`Failed to start ${session}: ${e.message}`))
+                console.error(chalk.red(`Failed to start ${session}: ${errMsg(e)}`))
               )
         )
       );
@@ -467,12 +516,12 @@ async function startSessions() {
     }
 
     if (action === "new") {
-      const { sessionName } = await inquirer.prompt([
+      const { sessionName } = await inquirer.prompt<{ sessionName: string }>([
         {
           type: "input",
           name: "sessionName",
           message: chalk.cyan("Enter a name for the new session:"),
-          validate: (input) => {
+          validate: (input: string) => {
             input = input.trim();
             if (!input) return chalk.red("Session name cannot be empty");
             if (!isValidSessionName(input))
@@ -485,7 +534,7 @@ async function startSessions() {
         },
       ]);
 
-      const { authMethod } = await inquirer.prompt([
+      const { authMethod } = await inquirer.prompt<{ authMethod: "qr" | "code" }>([
         {
           type: "list",
           name: "authMethod",
@@ -509,7 +558,7 @@ async function startSessions() {
         return;
       }
 
-      const { sessionName } = await inquirer.prompt([
+      const { sessionName } = await inquirer.prompt<{ sessionName: string }>([
         {
           type: "list",
           name: "sessionName",
@@ -529,10 +578,10 @@ async function startSessions() {
       }
     }
   } catch (error) {
-    if (error.isTtyError) {
+    if ((error as { isTtyError?: boolean })?.isTtyError) {
       console.error(chalk.red("Terminal doesn't support interactive prompts"));
     } else {
-      console.error(chalk.red(`Error in startSessions: ${error.message}`));
+      console.error(chalk.red(`Error in startSessions: ${errMsg(error)}`));
     }
   }
 }
@@ -545,10 +594,10 @@ process.on("SIGINT", async () => {
     Object.entries(activeSessions).map(async ([sessionName, sock]) => {
       try {
         console.log(chalk.green(`Closing session: ${chalk.cyan(sessionName)}`));
-        sock.ev.removeAllListeners();
-        sock.end();
+        sock.ev.removeAllListeners("connection.update");
+        sock.end(undefined);
       } catch (error) {
-        console.error(chalk.red(`Error closing ${sessionName}: ${error.message}`));
+        console.error(chalk.red(`Error closing ${sessionName}: ${errMsg(error)}`));
       }
     })
   );
@@ -556,7 +605,7 @@ process.on("SIGINT", async () => {
   process.exit(0);
 });
 
-process.on("SIGTERM", () => process.emit("SIGINT"));
+process.on("SIGTERM", () => process.emit("SIGINT", "SIGINT"));
 
 process.on("uncaughtException", (error) => {
   console.error(chalk.red("Uncaught exception:"), error);
@@ -573,27 +622,31 @@ const sessionIdArg = process.env.SESSION_ID || process.argv[2];
 const isInteractive = process.stdin.isTTY;
 
 if (sessionIdArg) {
-  const authMethod = process.env.AUTH_METHOD || "qr";
+  const authMethod = (process.env.AUTH_METHOD as "qr" | "code" | undefined) || "qr";
   const phoneNumber = process.env.PHONE_NUMBER;
 
   console.log(chalk.blue(`Starting non-interactive session: ${chalk.cyan(sessionIdArg)} (${authMethod})`));
 
   startBotInstance(sessionIdArg, { authMethod, phoneNumber }).catch((error) => {
-    console.error(chalk.red(`Failed to start ${sessionIdArg}: ${error.message}`));
+    console.error(chalk.red(`Failed to start ${sessionIdArg}: ${errMsg(error)}`));
     process.exit(1);
   });
 } else if (isInteractive) {
   startSessions().catch((error) => {
-    console.error(chalk.red(`Failed to start: ${error.message}`));
+    console.error(chalk.red(`Failed to start: ${errMsg(error)}`));
     process.exit(1);
   });
 } else {
   console.error(chalk.red("No SESSION_ID provided and no TTY available for interactive selection."));
-  console.error(chalk.yellow("Run with: SESSION_ID=<name> node index.js  (add AUTH_METHOD=code PHONE_NUMBER=... for pairing code)"));
+  console.error(
+    chalk.yellow(
+      "Run with: SESSION_ID=<name> node index.js  (add AUTH_METHOD=code PHONE_NUMBER=... for pairing code)"
+    )
+  );
   process.exit(1);
 }
 
-module.exports = {
+export {
   startBotInstance,
   isSessionFolderEmpty,
   pendingSessions,
